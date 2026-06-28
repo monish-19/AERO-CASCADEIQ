@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.env
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Data files (too large for git — share via Google Drive or S3)
+data_pipeline/output/
+
+# Node
+node_modules/
+frontend/build/
+frontend/.env
+
+# Docker volumes
+pg_data/
+neo4j_data/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
