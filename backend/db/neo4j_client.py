@@ -3,150 +3,217 @@ Neo4j Client — Member 4 (Backend & API Engineer)
 Graph database client. Graph schema owned by M2.
 Used by propagation_engine.py to traverse the dependency graph.
 """
-# TODO (M4): Neo4j driver setup and graph query helpers
-"""
-Neo4j Graph Query Layer — Member 2 (Graph & Knowledge Engineer)
-Provides graph traversal functions for M4's propagation engine.
-"""
-
-from neo4j import GraphDatabase
 import os
+import logging
+from datetime import datetime
+import networkx as nx
 
-NEO4J_URI      = os.getenv("NEO4J_URI",      "bolt://localhost:7687")
-NEO4J_USER     = os.getenv("NEO4J_USER",     "neo4j")
-NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD", "password123")
+# Configure logger
+logger = logging.getLogger("db_neo4j")
+logging.basicConfig(level=logging.INFO)
 
+# Try importing neo4j
+try:
+    from neo4j import GraphDatabase
+    NEO4J_AVAILABLE = True
+except ImportError:
+    NEO4J_AVAILABLE = False
+    logger.warning("Neo4j python package not installed. Falling back to local graph simulation.")
 
-class AircraftGraphDB:
+class Neo4jClient:
     def __init__(self):
-        self.driver = GraphDatabase.driver(
-            NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD)
-        )
+        self.uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        self.user = os.getenv("NEO4J_USER", "neo4j")
+        self.password = os.getenv("NEO4J_PASSWORD", "password123")
+        self.driver = None
+        self.is_fallback = False
+        self.local_graph = nx.DiGraph()
+        
+    def connect(self):
+        """Connect to Neo4j. Fall back to local NetworkX graph if unavailable."""
+        if not NEO4J_AVAILABLE:
+            self.is_fallback = True
+            logger.info("Using local NetworkX fallback graph (Neo4j lib not available).")
+            return
+            
+        try:
+            logger.info(f"Connecting to Neo4j at {self.uri}")
+            self.driver = GraphDatabase.driver(self.uri, auth=(self.user, self.password))
+            # Verify connectivity
+            self.driver.verify_connectivity()
+            logger.info("Successfully connected to Neo4j database.")
+        except Exception as e:
+            logger.warning(f"Could not connect to Neo4j ({e}). Falling back to local NetworkX graph.")
+            self.is_fallback = True
+            self.driver = None
 
     def close(self):
-        self.driver.close()
+        if self.driver:
+            self.driver.close()
+            logger.info("Neo4j driver closed.")
 
-    def get_all_lrus(self):
-        """Get all LRU nodes in the graph."""
-        with self.driver.session() as session:
-            result = session.run("""
-                MATCH (n:LRU)
-                RETURN n.id AS id, n.name AS name,
-                       n.ata_chapter AS ata_chapter,
-                       n.criticality AS criticality,
-                       n.current_state AS current_state,
-                       n.anomaly_score AS anomaly_score
-                ORDER BY n.criticality DESC
-            """)
-            return [dict(r) for r in result]
+    def seed_graph(self):
+        """Seed the 10 LRUs and their physical dependency propagation edges."""
+        lrus_data = [
+            {"id": "HYD-2A",     "name": "Hydraulic Pump 2A",           "ata": "29", "ltype": "hydraulic_pump", "weight": 0.90, "state": "HEALTHY", "score": 0.0},
+            {"id": "ACT-L4",     "name": "Left Aileron Actuator",        "ata": "27", "ltype": "actuator",       "weight": 0.95, "state": "HEALTHY", "score": 0.0},
+            {"id": "FCU-L",      "name": "Rudder PCU Left",              "ata": "27", "ltype": "pcu",            "weight": 0.90, "state": "HEALTHY", "score": 0.0},
+            {"id": "ENG1-FADEC", "name": "Engine 1 FADEC",               "ata": "73", "ltype": "fadec",          "weight": 0.95, "state": "HEALTHY", "score": 0.0},
+            {"id": "BLEED-V1",   "name": "Engine 1 Bleed Valve",         "ata": "36", "ltype": "bleed_valve",    "weight": 0.70, "state": "HEALTHY", "score": 0.0},
+            {"id": "AVNX-COOL",  "name": "Avionics Cooling Unit",        "ata": "21", "ltype": "cooling",        "weight": 0.60, "state": "HEALTHY", "score": 0.0},
+            {"id": "ADIRU-1",    "name": "Air Data / Inertial Unit 1",   "ata": "34", "ltype": "adiru",          "weight": 0.90, "state": "HEALTHY", "score": 0.0},
+            {"id": "GEN-1",      "name": "Engine 1 Generator",           "ata": "24", "ltype": "generator",      "weight": 0.80, "state": "HEALTHY", "score": 0.0},
+            {"id": "FUEL-P1",    "name": "Engine 1 Fuel Pump",           "ata": "28", "ltype": "fuel_pump",      "weight": 0.85, "state": "HEALTHY", "score": 0.0},
+            {"id": "APU",        "name": "Auxiliary Power Unit",         "ata": "49", "ltype": "apu",            "weight": 0.50, "state": "HEALTHY", "score": 0.0}
+        ]
 
-    def get_downstream_neighbors(self, lru_id: str):
-        """
-        Get all LRUs directly affected by the given LRU.
-        Used by M4's propagation engine for cascade simulation.
-        """
-        with self.driver.session() as session:
-            result = session.run("""
-                MATCH (a:LRU {id: $lru_id})-[r:AFFECTS]->(b:LRU)
-                RETURN b.id AS affected_id,
-                       b.name AS affected_name,
-                       b.criticality AS criticality,
-                       r.edge_type AS edge_type,
-                       r.weight AS weight,
-                       r.delay_flights AS delay_flights,
-                       r.description AS description
-                ORDER BY r.weight DESC
-            """, lru_id=lru_id)
-            return [dict(r) for r in result]
+        edges_data = [
+            # Scenario 1: Hydraulic pump -> Aileron Actuator -> Rudder PCU Left
+            {"src": "HYD-2A", "tgt": "ACT-L4", "type": "hydraulic", "weight": 0.80},
+            {"src": "ACT-L4", "tgt": "FCU-L",  "type": "mechanical", "weight": 0.60},
+            # Scenario 2: Bleed Valve -> Avionics Cooling -> Air Data Unit 1
+            {"src": "BLEED-V1", "tgt": "AVNX-COOL", "type": "pneumatic", "weight": 0.70},
+            {"src": "AVNX-COOL", "tgt": "ADIRU-1",   "type": "thermal", "weight": 0.50}
+        ]
 
-    def get_full_cascade_path(self, root_lru_id: str, max_depth: int = 5):
-        """
-        Traverse the full cascade chain from a root LRU.
-        Returns all downstream LRUs up to max_depth hops away.
-        Used by M4 to simulate the full failure propagation.
-        """
-        with self.driver.session() as session:
-            result = session.run("""
-                MATCH path = (root:LRU {id: $root_id})-[:AFFECTS*1..5]->(affected:LRU)
-                WITH path, affected,
-                     [r in relationships(path) | r.weight] AS weights,
-                     [r in relationships(path) | r.delay_flights] AS delays,
-                     [r in relationships(path) | r.edge_type] AS edge_types,
-                     length(path) AS depth
-                RETURN affected.id AS affected_id,
-                       affected.name AS affected_name,
-                       affected.criticality AS criticality,
-                       affected.current_state AS current_state,
-                       depth,
-                       weights,
-                       delays,
-                       edge_types,
-                       reduce(p = 1.0, w IN weights | p * w) AS cascade_probability,
-                       reduce(d = 0, delay IN delays | d + delay) AS total_delay_flights
-                ORDER BY cascade_probability DESC
-            """, root_id=root_lru_id)
-            return [dict(r) for r in result]
+        if not self.is_fallback and self.driver:
+            try:
+                with self.driver.session() as session:
+                    # Seed nodes
+                    for node in lrus_data:
+                        session.run("""
+                            MERGE (n:LRU {id: $id})
+                            SET n.name = $name,
+                                n.ata_chapter = $ata,
+                                n.lru_type = $ltype,
+                                n.criticality_weight = $weight,
+                                n.current_state = $state,
+                                n.anomaly_score = $score,
+                                n.last_updated = $ts
+                        """, id=node["id"], name=node["name"], ata=node["ata"],
+                             ltype=node["ltype"], weight=node["weight"],
+                             state=node["state"], score=node["score"],
+                             ts=datetime.utcnow().isoformat())
+                    
+                    # Seed edges
+                    for edge in edges_data:
+                        session.run("""
+                            MATCH (src:LRU {id: $src})
+                            MATCH (tgt:LRU {id: $tgt})
+                            MERGE (src)-[r:PROPAGATES_TO]->(tgt)
+                            SET r.edge_type = $type,
+                                r.base_weight = $weight
+                        """, src=edge["src"], tgt=edge["tgt"],
+                             type=edge["type"], weight=edge["weight"])
+                logger.info("Successfully seeded Neo4j graph nodes and relationships.")
+            except Exception as e:
+                logger.error(f"Failed to seed Neo4j: {e}. Switching to local fallback mode.")
+                self.is_fallback = True
+                self.driver = None
 
-    def get_high_risk_lrus(self, threshold: float = 0.3):
-        """
-        Get all LRUs with anomaly score above threshold.
-        Called by M4 to find what needs immediate attention.
-        """
-        with self.driver.session() as session:
-            result = session.run("""
-                MATCH (n:LRU)
-                WHERE n.anomaly_score >= $threshold
-                RETURN n.id AS id, n.name AS name,
-                       n.current_state AS current_state,
-                       n.anomaly_score AS anomaly_score,
-                       n.criticality AS criticality
-                ORDER BY n.anomaly_score DESC
-            """, threshold=threshold)
-            return [dict(r) for r in result]
+        if self.is_fallback:
+            # Seed NetworkX fallback graph
+            logger.info("Seeding local NetworkX fallback graph...")
+            self.local_graph.clear()
+            for node in lrus_data:
+                self.local_graph.add_node(
+                    node["id"],
+                    name=node["name"],
+                    ata_chapter=node["ata"],
+                    lru_type=node["ltype"],
+                    criticality_weight=node["weight"],
+                    current_state=node["state"],
+                    anomaly_score=node["score"]
+                )
+            for edge in edges_data:
+                self.local_graph.add_edge(
+                    edge["src"],
+                    edge["tgt"],
+                    edge_type=edge["type"],
+                    base_weight=edge["weight"]
+                )
+            logger.info("Local NetworkX graph seeded.")
 
-    def update_lru_state(self, lru_id: str, state: str, anomaly_score: float):
-        """
-        Update LRU health state in the graph.
-        Called by M1's twin_sync after each flight.
-        """
-        with self.driver.session() as session:
-            session.run("""
-                MATCH (n:LRU {id: $lru_id})
-                SET n.current_state = $state,
-                    n.anomaly_score = $anomaly_score
-            """, lru_id=lru_id, state=state, anomaly_score=anomaly_score)
+    def get_all_edges(self):
+        """Retrieve all propagation edges. Returns list of dicts with keys: source, target, edge_type, base_weight."""
+        if not self.is_fallback and self.driver:
+            try:
+                with self.driver.session() as session:
+                    result = session.run("""
+                        MATCH (src:LRU)-[r:PROPAGATES_TO]->(tgt:LRU)
+                        RETURN src.id as source, tgt.id as target, r.edge_type as edge_type, r.base_weight as base_weight
+                    """)
+                    return [dict(record) for record in result]
+            except Exception as e:
+                logger.error(f"Neo4j query failed: {e}. Using local graph fallback.")
+                self.is_fallback = True
+                self.driver = None
+                
+        # Fallback local query
+        edges = []
+        for u, v, data in self.local_graph.edges(data=True):
+            edges.append({
+                "source": u,
+                "target": v,
+                "edge_type": data.get("edge_type", "unknown"),
+                "base_weight": data.get("base_weight", 0.5)
+            })
+        return edges
 
-    def update_edge_weight(self, from_lru: str, to_lru: str, new_weight: float):
-        """
-        Update edge weight after M3's GNN model learns better probabilities.
-        Called by M3's model serving layer.
-        """
-        with self.driver.session() as session:
-            session.run("""
-                MATCH (a:LRU {id: $from_id})-[r:AFFECTS]->(b:LRU {id: $to_id})
-                SET r.weight = $new_weight
-            """, from_id=from_lru, to_id=to_lru, new_weight=new_weight)
+    def get_node_states(self) -> dict:
+        """Get all node states. Returns a dict mapping lru_code -> {current_state, anomaly_score, criticality_weight}."""
+        if not self.is_fallback and self.driver:
+            try:
+                with self.driver.session() as session:
+                    result = session.run("""
+                        MATCH (n:LRU)
+                        RETURN n.id as id, n.current_state as current_state, n.anomaly_score as anomaly_score, n.criticality_weight as criticality_weight
+                    """)
+                    return {
+                        record["id"]: {
+                            "current_state": record["current_state"],
+                            "anomaly_score": record["anomaly_score"],
+                            "criticality_weight": record["criticality_weight"]
+                        }
+                        for record in result
+                    }
+            except Exception as e:
+                logger.error(f"Neo4j node state query failed: {e}. Using local graph fallback.")
+                self.is_fallback = True
+                self.driver = None
+                
+        # Fallback local query
+        return {
+            node: {
+                "current_state": data.get("current_state", "HEALTHY"),
+                "anomaly_score": data.get("anomaly_score", 0.0),
+                "criticality_weight": data.get("criticality_weight", 0.5)
+            }
+            for node, data in self.local_graph.nodes(data=True)
+        }
 
+    def sync_node_health(self, lru_code: str, state: str, score: float):
+        """Update node health properties in the graph."""
+        if not self.is_fallback and self.driver:
+            try:
+                with self.driver.session() as session:
+                    session.run("""
+                        MERGE (n:LRU {id: $id})
+                        SET n.current_state = $state,
+                            n.anomaly_score = $score,
+                            n.last_updated = $ts
+                    """, id=lru_code, state=state, score=score, ts=datetime.utcnow().isoformat())
+                return
+            except Exception as e:
+                logger.error(f"Neo4j update failed: {e}. Updating local graph fallback.")
+                self.is_fallback = True
+                self.driver = None
+                
+        # Fallback local update
+        if lru_code in self.local_graph:
+            self.local_graph.nodes[lru_code]["current_state"] = state
+            self.local_graph.nodes[lru_code]["anomaly_score"] = score
+            self.local_graph.nodes[lru_code]["last_updated"] = datetime.utcnow().isoformat()
 
-if __name__ == "__main__":
-    db = AircraftGraphDB()
-
-    print("All LRUs:")
-    for lru in db.get_all_lrus():
-        print(f"  {lru['id']}: {lru['current_state']} (criticality={lru['criticality']})")
-
-    print("\nCascade path from HYD-2A:")
-    for path in db.get_full_cascade_path("HYD-2A"):
-        print(f"  → {path['affected_id']} "
-              f"(prob={path['cascade_probability']:.2f}, "
-              f"delay={path['total_delay_flights']} flights)")
-
-    print("\nCascade path from BLEED-V1:")
-    for path in db.get_full_cascade_path("BLEED-V1"):
-        print(f"  → {path['affected_id']} "
-              f"(prob={path['cascade_probability']:.2f}, "
-              f"delay={path['total_delay_flights']} flights)")
-
-    db.close()
-    print("\nGraph query layer working correctly!")
-    
+# Instantiate single client instance
+neo4j_client = Neo4jClient()
